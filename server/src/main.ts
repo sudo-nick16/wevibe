@@ -2,8 +2,12 @@ import ytdl from "ytdl-core-discord";
 import { logger } from "./logger.ts";
 import { WebSocketServer, WebSocket } from 'ws'
 import { MSG_TYPE } from "common";
+import { OpusDecoder } from "opus-decoder";
+import internal from "stream";
 
 const PORT = 4000;
+
+const opusDecoder = new OpusDecoder();
 
 interface Room {
 	members: WebSocket[],
@@ -43,22 +47,44 @@ async function playAudioStream(roomId: string) {
 	}
 	const url = room.queue[0];
 	ROOMS.set(roomId, { ...room, status: "play" });
-	const stream = await ytdl(url, { 
-		dlChunkSize: 3000
-	});
+	let stream: internal.Readable | undefined = undefined;
+	try {
+		stream = await ytdl(url, {
+			dlChunkSize: 3000
+		});
+	} catch (error) {
+		logger.error(error);
+	}
+	if (stream === undefined) {
+		return;
+	}
 	stream.on('data', (b: Buffer) => {
 		let room = ROOMS.get(roomId)!;
-		for (let socket of room.members) {
-			socket.send(b);
-		}
+		opusDecoder.ready.then(() => {
+			const da = opusDecoder.decodeFrame(new Uint8Array(b));
+			const buffer = new ArrayBuffer(3 * 4 + (da.samplesDecoded * 2 * 4));
+			const view = new DataView(buffer);
+			view.setUint32(0, MSG_TYPE.CREATE_STREAM);
+			view.setUint32(4, da.sampleRate);
+			view.setUint32(8, da.samplesDecoded);
+			let offset = 12;
+			da.channelData.forEach(c => {
+				new Float32Array(buffer, offset, c.length).set(c);
+				offset += c.byteLength;
+			})
+			for (let socket of room.members) {
+				socket.send(buffer);
+			}
+		})
 	})
 	stream.on('end', () => {
 		logger.info("stream ended.");
 		let room = ROOMS.get(roomId)!;
+		const buffer = new ArrayBuffer(4);
+		const view = new DataView(buffer);
+		view.setUint32(0, MSG_TYPE.END_STREAM);
 		for (let socket of room.members) {
-			socket.send(JSON.stringify({
-				type: MSG_TYPE.END_STREAM
-			}));
+			socket.send(buffer);
 		}
 		shiftQueue(roomId);
 		playAudioStream(roomId);
